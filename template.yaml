@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EFS PHZ Tools - Automated PHZ record management for cross-VPC EFS access.
+  Includes: Audit (periodic inspection) and Sync (event-driven auto-management).
+
+Parameters:
+  # ==================== Component Selection ====================
+  DeployAudit:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Deploy the Audit component (periodic inspection of PHZ records)
+  DeploySync:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Deploy the Sync component (auto-manage records on EFS/MT changes)
+
+  # ==================== Common Parameters ====================
+  PhzIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of PHZ Hosted Zone IDs
+  EfsVpcIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of source VPC IDs containing EFS
+  AlertEmails:
+    Type: CommaDelimitedList
+    Description: Comma-separated email addresses for alerts
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for Lambda deployment packages
+
+  # ==================== Audit Parameters ====================
+  ScheduleExpression:
+    Type: String
+    Default: "rate(1 day)"
+    Description: >
+      EventBridge schedule for audit frequency.
+      Examples: "rate(1 day)", "cron(0 2 * * ? *)"
+
+  # ==================== S3 Keys ====================
+  S3KeyLayer:
+    Type: String
+    Default: efs-phz-tools/layer.zip
+  S3KeyAuditHandler:
+    Type: String
+    Default: efs-phz-tools/audit-handler.zip
+  S3KeySyncHandler:
+    Type: String
+    Default: efs-phz-tools/sync-handler.zip
+
+Conditions:
+  IsAuditEnabled: !Equals [!Ref DeployAudit, "true"]
+  IsSyncEnabled: !Equals [!Ref DeploySync, "true"]
+
+Resources:
+  # ==================== Shared: SNS ====================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+
+  # ==================== Shared: Lambda Layer ====================
+  SharedLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-layer"
+      Description: Shared library for EFS PHZ tools (scanner, checker, record_manager)
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3KeyLayer
+
+  # ==================== Audit: IAM ====================
+  AuditLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: IsAuditEnabled
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-audit-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuditPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EFSReadOnly
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:DescribeMountTargets
+                Resource: "*"
+              - Sid: EC2ReadOnly
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Sid: Route53ReadOnly
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                Resource: "arn:aws:route53:::hostedzone/*"
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: "EFS/PHZAudit"
+
+  # ==================== Audit: Lambda ====================
+  AuditFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsAuditEnabled
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-audit"
+      Description: EFS PHZ audit - periodic inspection of DNS record correctness
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: handler.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt AuditLambdaRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3KeyAuditHandler
+      Environment:
+        Variables:
+          PHZ_IDS: !Join [",", !Ref PhzIds]
+          EFS_VPC_IDS: !Join [",", !Ref EfsVpcIds]
+          SNS_TOPIC_ARN: !Ref AlertTopic
+
+  # ==================== Audit: EventBridge Schedule ====================
+  AuditScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: IsAuditEnabled
+    Properties:
+      Name: !Sub "${AWS::StackName}-audit-schedule"
+      Description: !Sub "Periodic EFS PHZ audit (${ScheduleExpression})"
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: AuditLambda
+          Arn: !GetAtt AuditFunction.Arn
+
+  AuditSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsAuditEnabled
+    Properties:
+      FunctionName: !Ref AuditFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AuditScheduleRule.Arn
+
+  # ==================== Audit: CloudWatch Alarm ====================
+  AuditIssueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsAuditEnabled
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-issues-detected"
+      AlarmDescription: >
+        EFS PHZ audit detected issues.
+        Alert emails are sent directly by the Lambda function.
+        This alarm is for CloudWatch dashboard visibility only.
+      Namespace: EFS/PHZAudit
+      MetricName: IssueCount
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ==================== Sync: IAM ====================
+  SyncLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: IsSyncEnabled
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-sync-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SyncPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EFSReadOnly
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:DescribeMountTargets
+                Resource: "*"
+              - Sid: EC2ReadOnly
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Sid: Route53ReadWrite
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource: "arn:aws:route53:::hostedzone/*"
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Sid: SQSConsume
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SyncQueue.Arn
+
+  # ==================== Sync: SQS ====================
+  SyncDLQ:
+    Type: AWS::SQS::Queue
+    Condition: IsSyncEnabled
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-sync-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  SyncQueue:
+    Type: AWS::SQS::Queue
+    Condition: IsSyncEnabled
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-sync-queue"
+      VisibilityTimeout: 300  # 5x Lambda timeout
+      MessageRetentionPeriod: 86400  # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SyncDLQ.Arn
+        maxReceiveCount: 3
+
+  SyncQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: IsSyncEnabled
+    Properties:
+      Queues:
+        - !Ref SyncQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SyncQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt SyncEventRule.Arn
+
+  # ==================== Sync: Lambda ====================
+  SyncFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsSyncEnabled
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sync"
+      Description: EFS PHZ sync - auto-manage records on EFS/MT changes
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: handler.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt SyncLambdaRole.Arn
+      Layers:
+        - !Ref SharedLayer
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3KeySyncHandler
+      Environment:
+        Variables:
+          PHZ_IDS: !Join [",", !Ref PhzIds]
+          EFS_VPC_IDS: !Join [",", !Ref EfsVpcIds]
+          SNS_TOPIC_ARN: !Ref AlertTopic
+
+  SyncEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: IsSyncEnabled
+    Properties:
+      EventSourceArn: !GetAtt SyncQueue.Arn
+      FunctionName: !Ref SyncFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+      Enabled: true
+
+  # ==================== Sync: EventBridge Rule ====================
+  SyncEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsSyncEnabled
+    Properties:
+      Name: !Sub "${AWS::StackName}-sync-efs-events"
+      Description: Capture EFS mount target lifecycle events via CloudTrail
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.elasticfilesystem
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - elasticfilesystem.amazonaws.com
+          eventName:
+            - CreateMountTarget
+            - DeleteMountTarget
+            - DeleteFileSystem
+      Targets:
+        - Id: SyncQueue
+          Arn: !GetAtt SyncQueue.Arn
+
+Outputs:
+  # ==================== Shared Outputs ====================
+  AlertTopicArn:
+    Description: SNS topic ARN for alerts
+    Value: !Ref AlertTopic
+
+  # ==================== Audit Outputs ====================
+  AuditFunctionName:
+    Condition: IsAuditEnabled
+    Description: Audit Lambda function name
+    Value: !Ref AuditFunction
+
+  # ==================== Sync Outputs ====================
+  SyncFunctionName:
+    Condition: IsSyncEnabled
+    Description: Sync Lambda function name
+    Value: !Ref SyncFunction
+  SyncQueueUrl:
+    Condition: IsSyncEnabled
+    Description: SQS queue URL for sync events
+    Value: !Ref SyncQueue
