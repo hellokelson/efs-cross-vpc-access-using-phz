@@ -314,7 +314,7 @@ Resources:
       EventSourceArn: !GetAtt SyncQueue.Arn
       FunctionName: !Ref SyncFunction
       BatchSize: 10
-      MaximumBatchingWindowInSeconds: 30
+      MaximumBatchingWindowInSeconds: 60
       Enabled: true
 
   # ==================== Sync: EventBridge Rule ====================
