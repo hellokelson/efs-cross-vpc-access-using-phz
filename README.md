@@ -287,6 +287,36 @@ CreateMountTarget / DeleteMountTarget / DeleteFileSystem
 
 > **前提**：Region 中需启用 CloudTrail 管理事件（默认已启用）。
 
+**⏱️ 同步时效说明**
+
+从 EFS 变更（创建/删除 Mount Target）到 PHZ A 记录更新完成，通常需要 **5-15 分钟**：
+
+| 环节 | 预期延迟 | 说明 |
+|------|---------|------|
+| CloudTrail 事件记录 | 5-10 分钟 | AWS CloudTrail 将管理事件写入日志的时间（AWS 官方未给出精确承诺） |
+| EventBridge + SQS | < 1 分钟 | 事件路由和队列缓冲 |
+| Lambda 执行 | < 2 秒 | 扫描 EFS、计算记录、更新 PHZ |
+| Route 53 传播 | < 1 分钟 | PHZ 记录更新通常立即生效 |
+
+**如何验证同步是否成功**：
+
+```bash
+# 方式一：查看 Lambda 日志（推荐）
+aws logs tail /aws/lambda/efs-phz-tools-sync --region us-east-1 --follow
+
+# 方式二：手动触发并查看结果
+aws lambda invoke --function-name efs-phz-tools-sync --region us-east-1 /tmp/sync.json
+cat /tmp/sync.json | python3 -m json.tool
+
+# 方式三：检查 SQS 队列（确认事件已处理）
+aws sqs get-queue-attributes \
+  --queue-url $(aws cloudformation describe-stacks --stack-name efs-phz-tools \
+    --query 'Stacks[0].Outputs[?OutputKey==`SyncQueueUrl`].OutputValue' --output text) \
+  --attribute-names ApproximateNumberOfMessages --region us-east-1
+```
+
+> **提示**：如果 15 分钟后 PHZ 记录仍未更新，建议检查 CloudWatch Logs 和 DLQ（死信队列）中是否有错误消息。
+
 #### 部署后操作
 
 **1. 确认邮箱订阅**
