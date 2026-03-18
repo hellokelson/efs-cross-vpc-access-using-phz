@@ -560,16 +560,163 @@ Lambda Layer 中包含的共享库：
 
 ---
 
-## 8. 前提条件
+## 8. 部署权限要求
 
-- AWS CLI v2 已配置
-- 一个 S3 存储桶用于存放 Lambda 部署包
+### 部署者 IAM 权限
+
+执行 `deploy.sh` 部署 CloudFormation Stack 的用户或角色需要以下权限：
+
+| 权限类别 | 所需操作 | 最小权限示例 |
+|---------|---------|------------|
+| **CloudFormation** | 创建/更新/删除 Stack | `cloudformation:*` |
+| **S3** | 上传部署包、读取模板 | `s3:PutObject`, `s3:GetObject` (仅对部署桶) |
+| **IAM** | 创建 Lambda 执行角色 + Policy | `iam:CreateRole`, `iam:PutRolePolicy`, `iam:AttachRolePolicy`, `iam:PassRole` |
+| **Lambda** | 创建 Function + Layer | `lambda:CreateFunction`, `lambda:CreateLayerVersion`, `lambda:UpdateFunctionCode` |
+| **EventBridge** | 创建规则 + 目标 | `events:PutRule`, `events:PutTargets` |
+| **SQS** | 创建队列 + 策略 | `sqs:CreateQueue`, `sqs:SetQueueAttributes` |
+| **SNS** | 创建主题 + 订阅 | `sns:CreateTopic`, `sns:Subscribe` |
+| **CloudWatch** | 创建 Alarm | `cloudwatch:PutMetricAlarm` |
+| **Lambda Permission** | 授权 EventBridge/SQS 触发 | `lambda:AddPermission` |
+
+**实际建议**：
+
+```bash
+# 推荐方式一：使用 AdministratorAccess（最简单）
+# 适用场景：非生产环境、PoC、快速部署
+
+# 推荐方式二：使用 PowerUserAccess + IAM 权限（生产环境推荐）
+# PowerUserAccess 包含大部分 AWS 服务的完整权限，但需要额外授予 IAM 操作权限
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/efs-phz-tools-*"
+    }
+  ]
+}
+```
+
+**安全建议**：
+
+- ✅ 使用 CloudFormation 部署比手动创建更安全（资源有明确归属，易于审计和清理）
+- ✅ IAM 角色名称有 Stack 名称前缀（`efs-phz-tools-*`），权限范围可控
+- ✅ Lambda 执行角色遵循最小权限原则（详见下节）
+- ❌ 不建议在生产环境中给部署 Pipeline 使用 AdministratorAccess，应使用自定义策略限制资源范围
+
+### Lambda 运行时 IAM 权限
+
+CloudFormation 会自动创建两个 IAM 角色，权限已按最小权限原则配置：
+
+#### Audit Lambda 角色（只读）
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EFSReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeMountTargets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EC2ReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53ReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "SNSPublish",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "<AlertTopicArn>"
+    },
+    {
+      "Sid": "CloudWatchMetrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "EFS/PHZAudit"
+        }
+      }
+    }
+  ]
+}
+```
+
+#### Sync Lambda 角色（读 + Route 53 写）
+
+在 Audit 权限基础上，增加：
+
+```json
+{
+  "Sid": "Route53ReadWrite",
+  "Effect": "Allow",
+  "Action": [
+    "route53:ChangeResourceRecordSets"  // 额外的写权限
+  ],
+  "Resource": "arn:aws:route53:::hostedzone/*"
+},
+{
+  "Sid": "SQSConsume",
+  "Effect": "Allow",
+  "Action": [
+    "sqs:ReceiveMessage",
+    "sqs:DeleteMessage",
+    "sqs:GetQueueAttributes"
+  ],
+  "Resource": "<SyncQueueArn>"
+}
+```
+
+**权限范围说明**：
+
+- ✅ EFS/EC2 使用 `Resource: "*"` 因为这些服务不支持资源级别权限
+- ✅ Route 53 限制为 `hostedzone/*`，不能操作其他 Route 53 资源（如 Health Check）
+- ✅ SNS/SQS 限制为特定的 Topic/Queue ARN
+- ✅ CloudWatch Metrics 限制为特定 namespace `EFS/PHZAudit`
+
+---
+
+## 9. 前提条件
+
+- AWS CLI v2 已配置（部署用户需具备 Admin 或 PowerUserAccess + IAM 权限）
+- 一个 S3 存储桶用于存放 Lambda 部署包（部署用户需有 `s3:PutObject` 权限）
 - bash 终端 + `zip` 命令
 - Region 中已启用 CloudTrail 管理事件（默认已启用，Sync 组件需要）
 
 ---
 
-## 9. 运维管理
+## 10. 运维管理
 
 ### 添加/移除告警邮箱
 
@@ -625,7 +772,7 @@ uv run --with pytest --no-project -- python -m pytest audit/tests/ sync/tests/ -
 
 ---
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### Q: 源 VPC（有 EFS 的 VPC）能关联 PHZ 吗？
 
