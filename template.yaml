@@ -257,11 +257,11 @@ Resources:
     Condition: IsSyncEnabled
     Properties:
       QueueName: !Sub "${AWS::StackName}-sync-queue"
-      VisibilityTimeout: 300  # 5x Lambda timeout
+      VisibilityTimeout: 60  # 1 minute retry interval (Lambda typically runs in 1-2s)
       MessageRetentionPeriod: 86400  # 1 day
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDLQ.Arn
-        maxReceiveCount: 6
+        maxReceiveCount: 6  # Max 6 retries = ~6 minutes total
 
   SyncQueuePolicy:
     Type: AWS::SQS::QueuePolicy

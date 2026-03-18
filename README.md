@@ -289,14 +289,17 @@ CreateMountTarget / DeleteMountTarget / DeleteFileSystem
 
 **⏱️ 同步时效说明**
 
-从 EFS 变更（创建/删除 Mount Target）到 PHZ A 记录更新完成，通常需要 **5-15 分钟**：
+从 EFS 变更（创建/删除 Mount Target）到 PHZ A 记录更新完成，通常需要 **2-10 分钟**：
 
 | 环节 | 预期延迟 | 说明 |
 |------|---------|------|
 | CloudTrail 事件记录 | 5-10 分钟 | AWS CloudTrail 将管理事件写入日志的时间（AWS 官方未给出精确承诺） |
 | EventBridge + SQS | < 1 分钟 | 事件路由和队列缓冲 |
+| Mount Target 创建完成 | 1-5 分钟 | Mount Target 从 `creating` 变为 `available` 状态 |
 | Lambda 执行 | < 2 秒 | 扫描 EFS、计算记录、更新 PHZ |
 | Route 53 传播 | < 1 分钟 | PHZ 记录更新通常立即生效 |
+
+**重要**：CloudTrail 在 CreateMountTarget **API 调用时**就触发事件，但此时 Mount Target 还在 `creating` 状态。Sync Lambda 会检测到状态不符，主动抛出错误让 SQS 每 **1 分钟**重试一次（最多 6 次，共约 6 分钟），直到 Mount Target 变为 `available` 后才执行同步。这是正常的设计行为，不是故障。
 
 **如何验证同步是否成功**：
 
@@ -315,7 +318,7 @@ aws sqs get-queue-attributes \
   --attribute-names ApproximateNumberOfMessages --region us-east-1
 ```
 
-> **提示**：如果 15 分钟后 PHZ 记录仍未更新，建议检查 CloudWatch Logs 和 DLQ（死信队列）中是否有错误消息。
+> **提示**：如果 10 分钟后 PHZ 记录仍未更新，建议检查 CloudWatch Logs 和 DLQ（死信队列）中是否有错误消息。
 
 #### 部署后操作
 
@@ -473,7 +476,91 @@ Sync 组件在**执行了记录变更**时发送 SNS 邮件通知，内容包含
 
 ---
 
-## 7. 前提条件
+## 7. 部署资源技术规格
+
+### Lambda 函数配置
+
+| 配置项 | Audit Lambda | Sync Lambda | 说明 |
+|--------|-------------|-------------|------|
+| **Runtime** | Python 3.12 | Python 3.12 | AWS 托管运行时，自动安全补丁 |
+| **架构** | ARM64 (Graviton2) | ARM64 (Graviton2) | 比 x86_64 性能提升 34%，成本降低 20% |
+| **内存** | 256 MB | 256 MB | 实际使用 ~107 MB |
+| **超时** | 120 秒 | 60 秒 | 实际运行 < 2 秒 |
+| **并发** | 按需 | 按需 | 使用保留并发，无预留并发费用 |
+| **代码大小** | ~10 KB | ~15 KB | 轻量级，快速冷启动 |
+| **Layer** | efs-phz-tools-layer (~50 KB) | efs-phz-tools-layer (~50 KB) | 共享库：scanner, checker, record_manager |
+
+### 网络与安全配置
+
+| 配置项 | 说明 |
+|--------|------|
+| **Lambda VPC** | **无 VPC 配置**（运行在 AWS 托管网络） |
+| **互联网访问** | 通过 AWS 公网访问 EFS、Route 53、SNS 等 API |
+| **IAM 权限** | 最小权限原则，只读 EFS/EC2/Route53，Sync 额外有 Route53 写权限 |
+| **加密** | 代码包在 S3 静态加密（SSE-S3），环境变量无敏感信息 |
+| **日志** | CloudWatch Logs，默认保留 Never Expire（可按需调整） |
+
+> **为什么 Lambda 不在 VPC 中？**
+>
+> Audit 和 Sync Lambda 只调用 AWS API（EFS、EC2、Route 53、SNS），不需要访问 VPC 内资源：
+> - ✅ **优点**：无冷启动延迟（VPC Lambda 冷启动需 10+ 秒），无需 NAT Gateway（节省 ~$32/月）
+> - ✅ **安全性**：通过 IAM 角色控制权限，AWS API 全部通过 HTTPS 加密
+> - ❌ **不适用场景**：如果需要直接访问 Mount Target IP（如健康检查），需配置 VPC + NAT Gateway
+
+### Region 与多区域部署
+
+| 配置项 | 说明 |
+|--------|------|
+| **单 Region 部署** | 所有资源（Lambda、SQS、SNS、EventBridge）部署在同一 Region |
+| **PHZ 跨 Region** | Route 53 PHZ 是全球服务，但需要在目标 Region 关联到 VPC |
+| **CloudTrail** | 必须在**目标 Region** 启用管理事件（Sync 组件依赖） |
+| **多 Region 支持** | 每个 Region 独立部署一套 Stack，PHZ 可以在不同 Region 共享（关联多个 VPC） |
+
+**多 Region 部署示例**：
+
+```bash
+# Region 1: us-east-1（EFS 在此 Region）
+./deploy.sh --stack-name efs-phz-tools-use1 --region us-east-1 \
+  --phz-ids "Z001" --efs-vpc-ids "vpc-aaa" ...
+
+# Region 2: us-west-2（另一组 EFS 在此 Region）
+./deploy.sh --stack-name efs-phz-tools-usw2 --region us-west-2 \
+  --phz-ids "Z002" --efs-vpc-ids "vpc-bbb" ...
+```
+
+### 依赖的 AWS 服务
+
+| AWS 服务 | 用途 | 必需 | 计费 |
+|----------|------|------|------|
+| **Lambda** | 运行 Audit/Sync 逻辑 | ✅ | 按调用次数 + 执行时间 |
+| **CloudWatch Logs** | Lambda 日志存储 | ✅ | 按存储量 |
+| **EventBridge** | 定时触发 Audit + EFS 事件路由 | ✅ | 定时规则免费，事件投递免费 |
+| **SQS** | Sync 事件缓冲 + 重试 | ✅ (Sync) | 按请求次数 |
+| **SNS** | 邮件告警 | ✅ | 按邮件数 |
+| **CloudWatch Metrics** | 指标监控 | 可选 | 按自定义指标数 |
+| **CloudWatch Alarms** | 告警状态 | 可选 | 按 Alarm 数 |
+| **CloudTrail** | EFS API 事件捕获 | ✅ (Sync) | 管理事件免费（前 90 天） |
+| **Route 53** | PHZ + A 记录管理 | ✅ | 按 Hosted Zone 数 + 记录变更次数 |
+| **S3** | Lambda 部署包存储 | ✅ | 按存储量 + 访问次数 |
+
+### Python 依赖包
+
+Lambda Layer 中包含的共享库：
+
+```python
+# shared/python/efs_phz_audit/
+├── scanner.py          # EFS/MT 扫描 + 期望记录计算
+├── checker.py          # 期望 vs 实际记录对比
+├── record_manager.py   # PHZ 记录 UPSERT/DELETE 操作
+├── reporter.py         # 审计报告 + SNS 通知
+└── config.py           # 环境变量配置
+```
+
+**无外部依赖**：仅使用 Python 3.12 标准库 + `boto3`（AWS SDK，Lambda 运行时自带）
+
+---
+
+## 8. 前提条件
 
 - AWS CLI v2 已配置
 - 一个 S3 存储桶用于存放 Lambda 部署包
@@ -482,7 +569,7 @@ Sync 组件在**执行了记录变更**时发送 SNS 邮件通知，内容包含
 
 ---
 
-## 8. 运维管理
+## 9. 运维管理
 
 ### 添加/移除告警邮箱
 
@@ -538,7 +625,7 @@ uv run --with pytest --no-project -- python -m pytest audit/tests/ sync/tests/ -
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 ### Q: 源 VPC（有 EFS 的 VPC）能关联 PHZ 吗？
 
