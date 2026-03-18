@@ -261,7 +261,7 @@ Resources:
       MessageRetentionPeriod: 86400  # 1 day
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDLQ.Arn
-        maxReceiveCount: 3
+        maxReceiveCount: 6
 
   SyncQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -314,7 +314,7 @@ Resources:
       EventSourceArn: !GetAtt SyncQueue.Arn
       FunctionName: !Ref SyncFunction
       BatchSize: 10
-      MaximumBatchingWindowInSeconds: 60
+      MaximumBatchingWindowInSeconds: 30
       Enabled: true
 
   # ==================== Sync: EventBridge Rule ====================

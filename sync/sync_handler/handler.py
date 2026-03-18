@@ -89,6 +89,13 @@ def lambda_handler(event, context):
     logger.info("Found %d mount targets, %d expected records",
                 len(mount_targets), len(expected_records))
 
+    # Check for MTs still in "creating" state (need SQS retry)
+    creating_mts = [mt for mt in mount_targets if mt.state != "available"]
+    if creating_mts and not is_manual:
+        creating_info = [(mt.efs_id, mt.az, mt.state) for mt in creating_mts]
+        logger.warning("MTs not yet available, will retry via SQS: %s", creating_info)
+        raise RuntimeError(f"{len(creating_mts)} mount target(s) still creating, retry later")
+
     # Reconcile each PHZ
     results: dict[str, dict] = {}
     total_upserted = 0

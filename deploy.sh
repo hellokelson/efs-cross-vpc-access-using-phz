@@ -87,9 +87,11 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 S3_PREFIX="efs-phz-tools"
-LAYER_KEY="${S3_PREFIX}/layer.zip"
-AUDIT_HANDLER_KEY="${S3_PREFIX}/audit-handler.zip"
-SYNC_HANDLER_KEY="${S3_PREFIX}/sync-handler.zip"
+
+# S3 keys will be set after packaging (include content hash for CloudFormation change detection)
+LAYER_KEY=""
+AUDIT_HANDLER_KEY=""
+SYNC_HANDLER_KEY=""
 
 echo "=========================================="
 echo "  EFS PHZ Tools 部署"
@@ -107,6 +109,15 @@ fi
 echo "Region:     ${REGION}"
 echo ""
 
+# --- 计算内容哈希的辅助函数（兼容 macOS 和 Linux）---
+content_hash() {
+    if command -v md5sum &>/dev/null; then
+        md5sum "$1" | cut -c1-8
+    else
+        md5 -q "$1" | cut -c1-8
+    fi
+}
+
 # --- 打包 Lambda Layer（共享） ---
 echo "打包 Lambda Layer..."
 LAYER_DIR=$(mktemp -d)
@@ -114,6 +125,8 @@ mkdir -p "${LAYER_DIR}/python"
 cp -r "${SCRIPT_DIR}/shared/python/efs_phz_audit" "${LAYER_DIR}/python/"
 find "${LAYER_DIR}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 (cd "${LAYER_DIR}" && zip -r layer.zip python/ > /dev/null)
+LAYER_HASH=$(content_hash "${LAYER_DIR}/layer.zip")
+LAYER_KEY="${S3_PREFIX}/layer-${LAYER_HASH}.zip"
 aws s3 cp "${LAYER_DIR}/layer.zip" "s3://${S3_BUCKET}/${LAYER_KEY}" --region "${REGION}" > /dev/null
 echo "  Layer 已上传: s3://${S3_BUCKET}/${LAYER_KEY}"
 rm -rf "${LAYER_DIR}"
@@ -124,6 +137,8 @@ if [ "${DEPLOY_AUDIT}" = "true" ]; then
     HANDLER_DIR=$(mktemp -d)
     cp "${SCRIPT_DIR}/audit/audit_handler/handler.py" "${HANDLER_DIR}/"
     (cd "${HANDLER_DIR}" && zip -r handler.zip handler.py > /dev/null)
+    AUDIT_HASH=$(content_hash "${HANDLER_DIR}/handler.zip")
+    AUDIT_HANDLER_KEY="${S3_PREFIX}/audit-handler-${AUDIT_HASH}.zip"
     aws s3 cp "${HANDLER_DIR}/handler.zip" "s3://${S3_BUCKET}/${AUDIT_HANDLER_KEY}" --region "${REGION}" > /dev/null
     echo "  Audit Handler 已上传: s3://${S3_BUCKET}/${AUDIT_HANDLER_KEY}"
     rm -rf "${HANDLER_DIR}"
@@ -135,10 +150,16 @@ if [ "${DEPLOY_SYNC}" = "true" ]; then
     HANDLER_DIR=$(mktemp -d)
     cp "${SCRIPT_DIR}/sync/sync_handler/handler.py" "${HANDLER_DIR}/"
     (cd "${HANDLER_DIR}" && zip -r handler.zip handler.py > /dev/null)
+    SYNC_HASH=$(content_hash "${HANDLER_DIR}/handler.zip")
+    SYNC_HANDLER_KEY="${S3_PREFIX}/sync-handler-${SYNC_HASH}.zip"
     aws s3 cp "${HANDLER_DIR}/handler.zip" "s3://${S3_BUCKET}/${SYNC_HANDLER_KEY}" --region "${REGION}" > /dev/null
     echo "  Sync Handler 已上传: s3://${S3_BUCKET}/${SYNC_HANDLER_KEY}"
     rm -rf "${HANDLER_DIR}"
 fi
+
+# --- 未部署组件使用占位 key ---
+[ -z "${AUDIT_HANDLER_KEY}" ] && AUDIT_HANDLER_KEY="${S3_PREFIX}/audit-handler.zip"
+[ -z "${SYNC_HANDLER_KEY}" ] && SYNC_HANDLER_KEY="${S3_PREFIX}/sync-handler.zip"
 
 # --- 部署 CloudFormation ---
 echo ""
